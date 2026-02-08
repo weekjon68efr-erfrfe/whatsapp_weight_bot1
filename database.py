@@ -27,11 +27,18 @@ class Database:
                 phone TEXT UNIQUE NOT NULL,
                 full_name TEXT,
                 personal_phone TEXT,
+                truck_number TEXT,
                 is_registered BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Добавить колонку truck_number если её еще нет
+        try:
+            cursor.execute("ALTER TABLE drivers ADD COLUMN truck_number TEXT")
+        except:
+            pass  # Колонка уже существует
         
         # Таблица машин и их весов
         cursor.execute('''
@@ -112,7 +119,7 @@ class Database:
         conn.close()
         return dict(result)
     
-    def register_driver(self, phone: str, full_name: str, personal_phone: str) -> bool:
+    def register_driver(self, phone: str, full_name: str, personal_phone: str, truck_number: str = None) -> bool:
         """Зарегистрировать водителя"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -125,21 +132,21 @@ class Database:
             if result:
                 # Обновляем существующего водителя
                 cursor.execute(
-                    "UPDATE drivers SET full_name = ?, personal_phone = ?, is_registered = 1, updated_at = CURRENT_TIMESTAMP WHERE phone = ?",
-                    (full_name, personal_phone, phone)
+                    "UPDATE drivers SET full_name = ?, personal_phone = ?, truck_number = ?, is_registered = 1, updated_at = CURRENT_TIMESTAMP WHERE phone = ?",
+                    (full_name, personal_phone, truck_number, phone)
                 )
             else:
                 # Создаем нового зарегистрированного водителя
                 cursor.execute(
-                    "INSERT INTO drivers (phone, full_name, personal_phone, is_registered) VALUES (?, ?, ?, 1)",
-                    (phone, full_name, personal_phone)
+                    "INSERT INTO drivers (phone, full_name, personal_phone, truck_number, is_registered) VALUES (?, ?, ?, ?, 1)",
+                    (phone, full_name, personal_phone, truck_number)
                 )
             
             conn.commit()
             conn.close()
             return True
         except Exception as e:
-            print(f"❌ Ошибка регистрации: {e}")
+            print(f"Ошибка регистрации: {e}")
             conn.close()
             return False
     
@@ -148,33 +155,36 @@ class Database:
         driver = self.get_driver(phone)
         return driver and driver.get('is_registered', 0) == 1
     
-    def update_driver(self, phone: str, full_name: str = None, personal_phone: str = None) -> bool:
+    def update_driver(self, phone: str, full_name: str = None, personal_phone: str = None, truck_number: str = None) -> bool:
         """Обновить информацию о водителе"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
         try:
-            if full_name and personal_phone:
-                cursor.execute(
-                    "UPDATE drivers SET full_name = ?, personal_phone = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?",
-                    (full_name, personal_phone, phone)
-                )
-            elif full_name:
-                cursor.execute(
-                    "UPDATE drivers SET full_name = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?",
-                    (full_name, phone)
-                )
-            elif personal_phone:
-                cursor.execute(
-                    "UPDATE drivers SET personal_phone = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?",
-                    (personal_phone, phone)
-                )
+            updates = []
+            params = []
             
-            conn.commit()
+            if full_name:
+                updates.append("full_name = ?")
+                params.append(full_name)
+            if personal_phone:
+                updates.append("personal_phone = ?")
+                params.append(personal_phone)
+            if truck_number is not None:
+                updates.append("truck_number = ?")
+                params.append(truck_number)
+            
+            if updates:
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(phone)
+                query = f"UPDATE drivers SET {', '.join(updates)} WHERE phone = ?"
+                cursor.execute(query, params)
+                conn.commit()
+            
             conn.close()
             return True
         except Exception as e:
-            print(f"❌ Ошибка обновления водителя: {e}")
+            print(f"Ошибка обновления водителя: {e}")
             conn.close()
             return False
     
