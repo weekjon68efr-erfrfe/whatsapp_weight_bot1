@@ -96,6 +96,7 @@ def show_main_menu(phone: str) -> str:
     return f"""
 Выберите действие:
 1 - Новый отчет о взвешивании
+2 - Изменить номер машины
 3 - Переоформить регистрацию
 0 - Главное меню
 """
@@ -108,7 +109,7 @@ def start_registration(phone: str) -> str:
     db.set_user_state(phone, 'registration_name')
     
     return """
-РЕГИСТРАЦИЯ ВОДИТЕЛЯ
+Регистрация водителя
 
 Добро пожаловать! Для начала работы нужно зарегистрироваться.
 
@@ -127,13 +128,13 @@ def handle_registration_name(phone: str, text: str) -> str:
     full_name = text.strip()
     
     if len(full_name) < 3:
-        return "❌ Пожалуйста, введите полное имя (минимум 3 символа)"
+        return "Пожалуйста, введите полное имя (минимум 3 символа)"
     
     # Сохраняем имя во временные данные
     db.set_user_state(phone, 'registration_phone', temp_data={'full_name': full_name})
     
     return f"""
-✅ ФИО: {full_name}
+ФИО: {full_name}
 
 Теперь введите ваш личный номер телефона:
 Пример: 89123456789
@@ -152,29 +153,56 @@ def handle_registration_phone(phone: str, text: str) -> str:
     phone_clean = ''.join(filter(str.isdigit, text))
     
     if len(phone_clean) < 6:  # Минимум 6 цифр
-        return "❌ Неверный номер телефона. Введите еще раз (например: 89123456789)"
+        return "Неверный номер телефона. Введите еще раз (например: 89123456789)"
     
     state = db.get_user_state(phone)
     temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
     
     full_name = temp_data.get('full_name', '?')
     
-    # Регистрируем водителя
-    success = db.register_driver(phone, full_name, phone_clean)
+    # Сохраняем телефон и переходим к номеру машины
+    temp_data['personal_phone'] = phone_clean
+    db.set_user_state(phone, 'registration_truck', temp_data=temp_data)
+    
+    return "Введите номер вашей машины:"
+
+
+def handle_registration_truck(phone: str, text: str) -> str:
+    """Обработка ввода номера машины при регистрации"""
+    text_lower = text.lower().strip()
+    
+    # Проверяем команды
+    if text_lower == "0" or text_lower == "меню":
+        return show_main_menu(phone)
+    
+    truck_number = text.upper().strip()
+    
+    if len(truck_number) < 3:
+        return "Введите правильный номер машины"
+    
+    state = db.get_user_state(phone)
+    temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
+    
+    full_name = temp_data.get('full_name', '?')
+    personal_phone = temp_data.get('personal_phone', '')
+    
+    # Регистрируем водителя с номером машины
+    success = db.register_driver(phone, full_name, personal_phone, truck_number)
     
     if success:
         db.clear_user_state(phone)
         return f"""
-✅ РЕГИСТРАЦИЯ ЗАВЕРШЕНА!
+Регистрация завершена!
 
-Ваши данные сохранены:
+Данные:
 ФИО: {full_name}
-Телефон: +{phone_clean}
+Телефон: +{personal_phone}
+Машина: {truck_number}
 
 Отправьте "1" для заполнения нового груза
 """
     else:
-        return "❌ Ошибка при регистрации. Попробуйте еще раз."
+        return "Ошибка при регистрации. Попробуйте еще раз."
 
 
 # ==================== ОБРАБОТКА СООБЩЕНИЙ ====================
@@ -224,6 +252,8 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
             return handle_registration_name(phone, text_original)
         elif state['state'] == 'registration_phone':
             return handle_registration_phone(phone, text_original)
+        elif state['state'] == 'registration_truck':
+            return handle_registration_truck(phone, text_original)
         
         # Если не понятно - в начало
         return start_registration(phone)
@@ -232,26 +262,47 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
     state = db.get_user_state(phone)
     
     # Сначала проверяем, может ли быть процесс переоформления регистрации
-    if state and state['state'] in ['registration_name', 'registration_phone']:
+    if state and state['state'] in ['registration_name', 'registration_phone', 'registration_truck']:
         if state['state'] == 'registration_name':
             return handle_registration_name(phone, text_original)
         elif state['state'] == 'registration_phone':
             return handle_registration_phone(phone, text_original)
+        elif state['state'] == 'registration_truck':
+            return handle_registration_truck(phone, text_original)
     
-    # Если текст = "1" - начинаем выбор машины (команда верхнего уровня)
+    # Команда "2" - изменить номер машины
+    if text_lower == "2":
+        db.set_user_state(phone, 'changing_truck')
+        return "Введите новый номер машины:"
+    
+    # Если текст = "1" - начинаем новый отчет (берем машину из профиля)
     if text_lower == "1":
-        last_truck = db.get_last_truck(phone)
-        if last_truck:
-            db.set_user_state(phone, 'awaiting_truck', temp_data={'last_truck': last_truck})
-            return f"""Введите "2" - {last_truck} (предыдущая машина)
-Либо введите номер новой машины"""
+        driver = db.get_driver(phone)
+        truck_number = driver.get('truck_number') if driver else None
+        
+        if truck_number:
+            # Переходим сразу к имени клиента
+            personal_phone = driver.get('personal_phone', '')
+            full_name = driver.get('full_name', '?')
+            
+            db.set_user_state(phone, 'awaiting_client', temp_data={
+                'truck_number': truck_number,
+                'driver_name': full_name,
+                'driver_phone': personal_phone
+            })
+            return "Введите имя клиента:"
         else:
-            db.set_user_state(phone, 'awaiting_truck')
-            return """Введите номер машины:"""
+            # Если номера машины нет - просим его установить
+            return "Номер машины не установлен. Выполните пункт меню 2 для установки номера машины."
     
     if state:
-        if state['state'] == 'awaiting_truck':
-            return handle_truck_number(phone, text_original)
+        if state['state'] == 'changing_truck':
+            truck_number = text_original.upper().strip()
+            if len(truck_number) < 3:
+                return "Введите правильный номер машины"
+            db.update_driver(phone, truck_number=truck_number)
+            db.clear_user_state(phone)
+            return f"Номер машины изменен на {truck_number}\n\nОтправьте 0 для главного меню"
         elif state['state'] == 'awaiting_client':
             return handle_client_name(phone, text_original)
         elif state['state'] == 'awaiting_photo':
@@ -302,48 +353,7 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
 
 # ==================== ПРОЦЕСС ЗАПОЛНЕНИЯ ОТЧЕТА ====================
 
-def start_report(phone: str, truck_number: str) -> str:
-    """Начать заполнение отчета для машины"""
-    # Создаем или получаем машину
-    vehicle = db.get_or_create_vehicle(truck_number)
-    
-    # Получаем данные водителя
-    driver = db.get_driver(phone)
-    full_name = driver['full_name'] if driver else '?'
-    personal_phone = driver['personal_phone'] if driver else ''
-    
-    # Сохраняем в состояние с телефоном из БД и переходим к клиенту
-    db.set_user_state(phone, 'awaiting_client', temp_data={
-        'truck_number': truck_number, 
-        'driver_name': full_name,
-        'driver_phone': personal_phone
-    })
-    
-    return f"""Введите имя клиента:"""
-
-
-def handle_truck_number(phone: str, text: str) -> str:
-    """Обработка номера машины (если вводится отдельно)"""
-    text_lower = text.lower().strip()
-    
-    # Проверяем команды
-    if text_lower == "0" or text_lower == "меню":
-        return show_main_menu(phone)
-    
-    # Проверяем, есть ли сохраненная предыдущая машина
-    state = db.get_user_state(phone)
-    temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
-    last_truck = temp_data.get('last_truck')
-    
-    # Если ввели "2" и есть предыдущая машина - используем её
-    if text_lower == "2" and last_truck:
-        truck_number = last_truck
-    else:
-        # Иначе используем введенный текст как номер машины
-        truck_number = text.upper().strip()
-    
-    return start_report(phone, truck_number)
-
+# ==================== ПРОЦЕСС ЗАПОЛНЕНИЯ ОТЧЕТА ====================
 
 def handle_client_name(phone: str, text: str) -> str:
     """Обработка имени клиента"""
@@ -353,18 +363,18 @@ def handle_client_name(phone: str, text: str) -> str:
     client_name = text.strip()
     
     if len(client_name) < 2:
-        return "❌ Введите имя клиента"
+        return "Введите имя клиента"
     
     temp_data['client_name'] = client_name
     db.set_user_state(phone, 'awaiting_weight', temp_data=temp_data)
     
-    return f"""Введите текущий вес машины с весов (в кг):"""
+    return "Введите текущий вес машины с весов (в кг):"
 
 
 def handle_photo_received(phone: str, has_media: bool, message_data: dict = None) -> str:
     """Обработка полученного фото"""
     if not has_media:
-        return "❌ Пожалуйста, отправьте фото. Просто загрузите изображение в чат."
+        return "Пожалуйста, отправьте фото. Просто загрузите изображение в чат."
     
     state = db.get_user_state(phone)
     temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
@@ -375,11 +385,11 @@ def handle_photo_received(phone: str, has_media: bool, message_data: dict = None
     # Сохраняем информацию о медиа
     if message_data:
         temp_data['media_data'] = message_data
-        print(f"💾 Сохранены данные о фото: {message_data.keys()}")
+        print(f"Сохранены данные о фото: {message_data.keys()}")
     
     db.set_user_state(phone, 'awaiting_confirmation', temp_data=temp_data)
     
-    print(f"✅ Фото успешно обработано и сохранено в состояние для {phone}")
+    print(f"Фото успешно обработано и сохранено в состояние для {phone}")
     
     # Получаем данные для подтверждения
     truck_number = temp_data.get('truck_number', '')
@@ -387,7 +397,7 @@ def handle_photo_received(phone: str, has_media: bool, message_data: dict = None
     previous_weight = temp_data.get('previous_weight', 0)
     weight_difference = temp_data.get('weight_difference', 0)
     
-    return f"""*ПОДТВЕРЖДЕНИЕ ОТЧЕТА*
+    return f"""Подтверждение отчета
 
 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
 Телефон: {temp_data.get('driver_phone', '?')}
@@ -397,8 +407,8 @@ def handle_photo_received(phone: str, has_media: bool, message_data: dict = None
 Вес предыдущий: {previous_weight:.0f} кг
 Разница: {weight_difference:+.0f} кг
 
-✅ Напишите "да" для сохранения
-❌ Напишите "нет" для отмены
+Напишите "да" для сохранения
+Напишите "нет" для отмены
 """
 
 
@@ -408,7 +418,7 @@ def handle_weight(phone: str, text: str) -> str:
         current_weight = float(text.strip())
         
         if current_weight <= 0:
-            return "❌ Вес должен быть больше нуля"
+            return "Вес должен быть больше нуля"
         
         state = db.get_user_state(phone)
         temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
@@ -424,7 +434,7 @@ def handle_weight(phone: str, text: str) -> str:
         # Вычисляем разницу
         weight_difference = current_weight - previous_weight
         
-        print(f"⚖️ Вес для машины {truck_number}:")
+        print(f"Вес для машины {truck_number}:")
         print(f"   Текущий: {current_weight} кг")
         print(f"   Предыдущий: {previous_weight} кг")
         print(f"   Разница: {weight_difference:+.0f} кг")
@@ -433,11 +443,10 @@ def handle_weight(phone: str, text: str) -> str:
         
         db.set_user_state(phone, 'awaiting_photo', temp_data=temp_data)
         
-        return f"""Отправьте фото показаний весов:
-"""
+        return "Отправьте фото показаний весов:"
     
     except ValueError:
-        return "❌ Введите вес цифрами (например: 15500)"
+        return "Введите вес цифрами (например: 15500)"
 
 
 def handle_confirmation(phone: str, text: str) -> str:
@@ -448,11 +457,11 @@ def handle_confirmation(phone: str, text: str) -> str:
     # Проверяем "нет" - отмена отчета
     if text.lower() in ['нет', 'no', 'н', 'n']:
         db.clear_user_state(phone)
-        return "❌ Отчет отменен.\n\n📝 Отправьте 1 для заполнения нового груза или 0 для главного меню"
+        return "Отчет отменен.\n\nОтправьте 1 для заполнения нового груза или 0 для главного меню"
     
     # Проверяем "да" - сохранение отчета
     if text.lower() not in ['да', 'yes', 'д', 'y']:
-        return "⚠️ Пожалуйста, напишите 'да' для сохранения или 'нет' для отмены"
+        return "Пожалуйста, напишите 'да' для сохранения или 'нет' для отмены"
     
     # Сохраняем отчет в БД
     driver = db.get_driver(phone)
@@ -475,14 +484,14 @@ def handle_confirmation(phone: str, text: str) -> str:
         
         db.clear_user_state(phone)
         
-        return f"""
-✅ *ОТЧЕТ СОХРАНЕН И ОТПРАВЛЕН!*
+        return """
+Отчет сохранен и отправлен!
 
 Отправьте "1" для заполнения нового груза
 0 - Главное меню
 """
     else:
-        return "❌ Ошибка при сохранении отчета. Попробуйте еще раз."
+        return "Ошибка при сохранении отчета. Попробуйте еще раз."
 
 
 # ==================== ОТПРАВКА ОТЧЕТОВ ====================
@@ -510,13 +519,13 @@ def send_report_to_group(phone: str, temp_data: dict, driver: dict):
 Вес предыдущий: {previous_weight:.0f} кг
 Разница: {weight_diff:+.0f} кг"""
     
-    print(f"📤 Отправка отчета в группу:\n{report}")
+    print(f"Отправка отчета в группу:\n{report}")
     
     # Получаем ID группы из конфига
     GROUP_ID = Config.GROUP_ID
     
     if GROUP_ID and GROUP_ID != "":
-        print(f"📨 Отправка в группу: {GROUP_ID}")
+        print(f"Отправка в группу: {GROUP_ID}")
         
         # Если есть фото - отправляем его вместе с отчетом как подпись
         if photo_received and media_data:
@@ -527,22 +536,22 @@ def send_report_to_group(phone: str, temp_data: dict, driver: dict):
                     photo_url = file_data.get('downloadUrl') or file_data.get('url')
                 
                 if photo_url:
-                    print(f"📸 Отправка фото с отчетом по URL: {photo_url}")
+                    print(f"Отправка фото с отчетом по URL: {photo_url}")
                     # Отправляем фото с подписью (текст отчета)
                     whatsapp.send_file_by_url(GROUP_ID, photo_url, "report.jpg", caption=report)
                 else:
                     # Если URL не найден, отправляем просто текст
-                    print(f"⚠️ URL фото не найден, отправляем текст отчета")
+                    print(f"URL фото не найден, отправляем текст отчета")
                     whatsapp.send_message(GROUP_ID, report)
             except Exception as e:
-                print(f"❌ Ошибка при отправке фото: {e}")
+                print(f"Ошибка при отправке фото: {e}")
                 # Отправляем текст если фото не получилось
                 whatsapp.send_message(GROUP_ID, report)
         else:
             # Отправляем только текст отчета
             whatsapp.send_message(GROUP_ID, report)
     else:
-        print(f"⚠️ GROUP_ID не установлен в .env файле")
+        print(f"GROUP_ID не установлен в .env файле")
         print(f"   Отчет НЕ отправлен в группу")
 
 
