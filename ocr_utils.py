@@ -45,6 +45,8 @@ def correct_image_orientation(image: np.ndarray) -> np.ndarray:
         # Быстрое распознавание для проверки
         try:
             text = pytesseract.image_to_string(rotated_gray, lang='rus+eng')
+            if text is None:
+                text = ""
             # Считаем количество цифр
             digit_count = sum(1 for c in text if c.isdigit())
             
@@ -174,6 +176,8 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         # Пытаемся распознать с первым вариантом обработки
         logger.info(f"   Попытка 1: основной метод обработки")
         text_primary = pytesseract.image_to_string(processed_primary, lang='rus+eng')
+        if text_primary is None:
+            text_primary = ""
         weight, method, candidates = extract_weight_value_advanced(text_primary)
         details['attempts'].append({'method': 'primary', 'weight': weight, 'text': text_primary})
         
@@ -188,6 +192,8 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         # Если не совпало - пробуем второй вариант обработки
         logger.info(f"   Попытка 2: альтернативный метод обработки")
         text_secondary = pytesseract.image_to_string(processed_secondary, lang='rus+eng')
+        if text_secondary is None:
+            text_secondary = ""
         weight, method, candidates = extract_weight_value_advanced(text_secondary)
         details['attempts'].append({'method': 'secondary', 'weight': weight, 'text': text_secondary})
         
