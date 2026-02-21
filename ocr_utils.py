@@ -226,9 +226,10 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
 
 def extract_weight_value_advanced(text: str) -> Tuple[Optional[float], str, List[float]]:
     """
-    Извлечь значение веса из текста с информацией о методе
-    Ищет числа в диапазоне разумных весов машин (5000-60000 кг)
-    Использует продвинутые паттерны распознавания
+    Простая и надежная логика извлечения веса
+    - Ищет числовые последовательности (игнорируя точки/запятые)
+    - Пропускает те, что начинаются с 0
+    - Исключает строки только с нулями
     
     Args:
         text: Текст, полученный от OCR
@@ -236,95 +237,62 @@ def extract_weight_value_advanced(text: str) -> Tuple[Optional[float], str, List
     Returns:
         Кортеж (вес_в_кг, метод_распознавания, список_кандидатов)
     """
-    if not text:
+    if not text or not text.strip():
         return None, 'empty', []
     
-    # Заменяем запятые на точки и очищаем от артефактов OCR
-    text = text.replace(',', '.')
-    text = text.replace('O', '0').replace('o', '0')  # Заменяем буквы O на ноль
-    text = text.replace('l', '1').replace('I', '1')  # Заменяем L и I на единицу
-    text = text.replace('S', '5').replace('s', '5')  # Заменяем S на 5 в числовом контексте
+    logger.info(f"   📝 Анализируем текст: {repr(text[:200])}")
     
+    # Разбиваем текст на строки
+    lines = text.split('\n')
     candidates = []
     
-    # УРОВЕНЬ 1: Очень специфичные паттерны для весов (максимальный приоритет)
-    specific_patterns = [
-        # Ищет "TOTAL", "GROSS", "БРУТТО", "GROSS WEIGHT" и т.д. с числом
-        (r'(?:total\s+weight|gross\s+weight|t\.weight|g\.weight|брутто|валовой|общий вес)\s*[:\-=]?\s*([0-9]{4,5}(?:[.,][0-9]+)?)', 'gross_weight'),
-        (r'(?:net\s+weight|чистый вес|вес груза|n\.weight)\s*[:\-=]?\s*([0-9]{4,5}(?:[.,][0-9]+)?)', 'net_weight'),
-        (r'(?:tare|тара|вес машины|тарный вес)\s*[:\-=]?\s*([0-9]{3,5}(?:[.,][0-9]+)?)', 'tare_weight'),
-    ]
-    
-    # УРОВЕНЬ 2: Паттерны с явными числовыми маркерами
-    marked_patterns = [
-        # Число перед/после явных маркеров килограммов
-        (r'([0-9]{4,5}(?:[.,][0-9]+)?)\s*(?:kg|кг|килограмм|kilograms)', 'explicit_kg'),
-        (r'(?:wt|вес|weight)\s*[:\-=]?\s*([0-9]{4,5}(?:[.,][0-9]+)?)', 'weight_label'),
-        # На цифровых весах часто ряд цифр после точки
-        (r'(?:^|\s)([0-9]{4,5})\s*(?:$|\s)', 'isolated_number'),
-    ]
-    
-    # УРОВЕНЬ 3: Общие паттерны с контекстом
-    context_patterns = [
-        (r'\b([0-9]{5})\b', 'five_digits'),       # 5 цифр - типичная ширина табло
-        (r'\b([0-9]{4,5})(?:\s|$)', 'number_end'), # 4-5 цифр в конце слова
-    ]
-    
-    # Применяем все уровни паттернов с приоритизацией
-    for patterns, level_name in [
-        (specific_patterns, 'SPECIFIC'),
-        (marked_patterns, 'MARKED'),
-        (context_patterns, 'CONTEXT')
-    ]:
-        for pattern, pattern_type in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-            for match in matches:
-                try:
-                    # Нормализуем число (заменяем запятую на точку)
-                    value_str = match.group(1).replace(',', '.')
-                    value = float(value_str)
-                    
-                    # Проверяем разумный диапазон для веса грузовика
-                    # Расширяем диапазон для большей гибкости
-                    if 5000 <= value <= 60000:
-                        candidates.append(value)
-                        logger.info(f"   [{level_name}] Найден: {value} кг (тип: {pattern_type})")
-                        
-                        # На уровне SPECIFIC сразу возвращаем (самый надежный)
-                        if level_name == 'SPECIFIC':
-                            logger.info(f"✅ SPECIFIC совпадение! Возвращаем: {value} кг")
-                            return value, pattern_type, [value]
-                except (ValueError, AttributeError, IndexError) as e:
-                    logger.debug(f"   Ошибка парсинга: {e}")
-                    pass
+    for line_idx, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
         
-        # Если на уровне MARKED нашли - используем
-        if level_name == 'MARKED' and candidates:
-            final_value = max(candidates)  # Берем максимум (обычно это полный вес)
-            logger.info(f"✅ MARKED совпадение! Возвращаем: {final_value} кг")
-            return final_value, 'marked', list(set(candidates))
+        logger.info(f"   Строка {line_idx}: '{line}'")
+        
+        # Убираем пробелы внутри чисел
+        # "356 . 00" -> "356.00"
+        line_cleaned = re.sub(r'\s+([0-9])', r'\1', line)
+        line_cleaned = re.sub(r'([0-9])\s+', r'\1', line_cleaned)
+        
+        # Ищем все последовательности цифр и точек/запятых
+        # например: 356.00, 356,00, 35600
+        number_matches = re.findall(r'([0-9][0-9.,]*[0-9]|[0-9]+)', line_cleaned)
+        
+        for match in number_matches:
+            # Убираем точки и запятые из числа
+            clean_num = match.replace('.', '').replace(',', '')
+            
+            # Пропускаем если начинается с 0
+            if clean_num[0] == '0':
+                logger.info(f"      ⏭️ Пропускаем (начинается с 0): {match}")
+                continue
+            
+            # Пропускаем если только нули (0, 00, 000, т.д.)
+            if all(c == '0' for c in clean_num):
+                logger.info(f"      ⏭️ Пропускаем (только нули): {match}")
+                continue
+            
+            try:
+                # Конвертируем в число
+                value = float(clean_num)
+                logger.info(f"      ✓ Найдено число: {match} → {value}")
+                candidates.append(value)
+            except ValueError:
+                pass
     
-    # Если нашли на уровне CONTEXT
-    if candidates:
-        candidates_unique = list(set(candidates))
-        candidates_unique.sort(reverse=True)
-        final_value = candidates_unique[0]
-        logger.info(f"✅ CONTEXT совпадение! Выбран: {final_value} из {candidates_unique}")
-        return final_value, 'context', candidates_unique
+    # Фильтруем кандидатов по разумному диапазону для грузовика
+    valid_candidates = [c for c in candidates if 100 <= c <= 100000]
     
-    # Последняя попытка: просто ищем большие числа в диапазоне
-    all_numbers = re.findall(r'\d{4,}(?:\.\d+)?', text)
-    if all_numbers:
-        try:
-            numbers = [float(n) for n in all_numbers]
-            # Фильтруем по расширенному диапазону
-            filtered = [n for n in numbers if 3000 <= n <= 100000]
-            if filtered:
-                largest = max(filtered)
-                logger.info(f"   [FALLBACK] Найдено крупное число: {largest}")
-                return largest, 'fallback_number', sorted(list(set(filtered)), reverse=True)
-        except ValueError:
-            pass
+    if valid_candidates:
+        logger.info(f"   ✅ Валидные кандидаты: {valid_candidates}")
+        # Возвращаем первый найденный (обычно он в первой строке - это основной вес)
+        final_weight = valid_candidates[0]
+        logger.info(f"   ✅ Выбран: {final_weight}")
+        return final_weight, 'direct_match', valid_candidates
     
     logger.warning(f"❌ Вес не найден в тексте")
     return None, 'not_found', candidates
