@@ -3,9 +3,15 @@ import os
 from datetime import datetime
 from database import Database
 from config import Config
+from ocr_utils import extract_weight_from_image
+import logging
 
 app = Flask(__name__)
 db = Database()
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class GreenApiClient:
@@ -296,6 +302,8 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
             return "Номер машины не установлен. Выполните пункт меню 2 для установки номера машины."
     
     if state:
+        temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
+        
         if state['state'] == 'changing_truck':
             truck_number = text_original.upper().strip()
             if len(truck_number) < 3:
@@ -306,9 +314,18 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
         elif state['state'] == 'awaiting_client':
             return handle_client_name(phone, text_original)
         elif state['state'] == 'awaiting_photo':
-            return handle_photo_received(phone, has_media)
-        elif state['state'] == 'awaiting_weight':
-            return handle_weight(phone, text_original)
+            # Получаем message_data из temp_data если есть медиа
+            message_data = temp_data.get('media_data', {}) if has_media else None
+            return handle_photo_received(phone, has_media, message_data)
+        elif state['state'] == 'awaiting_manual_weight':
+            # Пользователь либо вводит вес, либо отправляет новое фото
+            if has_media:
+                # Новое фото - обрабатываем его
+                message_data = temp_data.get('media_data', {})
+                return handle_photo_received(phone, True, message_data)
+            else:
+                # Попытка ввести вес вручную
+                return handle_manual_weight_input(phone, text_original)
         elif state['state'] == 'awaiting_confirmation':
             return handle_confirmation(phone, text_original)
         elif state['state'] == 'awaiting_stats_truck':
@@ -353,8 +370,6 @@ def process_message(phone: str, text: str, has_media: bool = False) -> str:
 
 # ==================== ПРОЦЕСС ЗАПОЛНЕНИЯ ОТЧЕТА ====================
 
-# ==================== ПРОЦЕСС ЗАПОЛНЕНИЯ ОТЧЕТА ====================
-
 def handle_client_name(phone: str, text: str) -> str:
     """Обработка имени клиента"""
     state = db.get_user_state(phone)
@@ -366,38 +381,155 @@ def handle_client_name(phone: str, text: str) -> str:
         return "Введите имя клиента"
     
     temp_data['client_name'] = client_name
-    db.set_user_state(phone, 'awaiting_weight', temp_data=temp_data)
+    # Пропускаем вопрос о весе и сразу переходим к фото
+    db.set_user_state(phone, 'awaiting_photo', temp_data=temp_data)
     
-    return "Введите текущий вес машины с весов (в кг):"
+    return "Отправьте фото показаний весов:"
+
+
+def handle_manual_weight_input(phone: str, text: str) -> str:
+    """Обработка ручного ввода веса, когда OCR не смог распознать"""
+    text_clean = text.strip()
+    
+    # Очищаем текст от букв и спецсимволов
+    weight_str = ''.join(c for c in text_clean if c.isdigit() or c == '.')
+    
+    try:
+        weight = float(weight_str)
+        
+        # Проверяем диапазон разумного веса
+        if weight < 100:  # Менее 100 кг - явно ошибка
+            return "⚠️ Вес слишком мал (нужно 5000-60000 кг)\n\nПопробуйте еще раз или отправьте новое фото"
+        
+        if weight > 150000:  # Более 150 тонн - явно ошибка
+            return "⚠️ Вес слишком велик (нужно 5000-60000 кг)\n\nПопробуйте еще раз или отправьте новое фото"
+        
+        # Вес принят - переходим к подтверждению
+        state = db.get_user_state(phone)
+        temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
+        
+        current_weight = weight
+        temp_data['current_weight'] = current_weight
+        temp_data['photo_received'] = True
+        temp_data['weight_manual_input'] = True  # Отмечаем, что вес введен вручную
+        
+        # Получаем предыдущий вес машины
+        truck_number = temp_data.get('truck_number', '')
+        previous_weight = db.get_last_weight(truck_number)
+        temp_data['previous_weight'] = previous_weight
+        
+        # Вычисляем разницу
+        weight_difference = current_weight - previous_weight
+        temp_data['weight_difference'] = weight_difference
+        
+        print(f"✅ Вес введен вручную: {current_weight} кг")
+        print(f"   Текущий: {current_weight} кг")
+        print(f"   Предыдущий: {previous_weight} кг")
+        print(f"   Разница: {weight_difference:+.0f} кг")
+        
+        # Переходим к подтверждению
+        db.set_user_state(phone, 'awaiting_confirmation', temp_data=temp_data)
+        
+        # Формируем сообщение подтверждения
+        return f"""✅ Подтверждение отчета
+
+Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+Телефон: {temp_data.get('driver_phone', '?')}
+Машина: {truck_number}
+Клиент: {temp_data.get('client_name', '?')}
+
+*Вес ВРУЧНУЮ введен:* {current_weight:.0f} кг
+Вес предыдущий: {previous_weight:.0f} кг
+Разница: {weight_difference:+.0f} кг
+
+Напишите "да" для сохранения
+Напишите "нет" для отмены
+"""
+    
+    except ValueError:
+        return "❌ Не понимаю. Напишите число, например: 15000\n\nИли отправьте новое фото весов"
+
 
 
 def handle_photo_received(phone: str, has_media: bool, message_data: dict = None) -> str:
-    """Обработка полученного фото"""
+    """Обработка полученного фото с распознаванием веса"""
     if not has_media:
         return "Пожалуйста, отправьте фото. Просто загрузите изображение в чат."
     
     state = db.get_user_state(phone)
     temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
     
-    # Отмечаем, что фото получено
-    temp_data['photo_received'] = True
+    print(f"📸 Обработка фото от {phone}")
     
     # Сохраняем информацию о медиа
     if message_data:
         temp_data['media_data'] = message_data
-        print(f"Сохранены данные о фото: {message_data.keys()}")
+        print(f"   Сохранены данные о фото: {message_data.keys()}")
     
-    db.set_user_state(phone, 'awaiting_confirmation', temp_data=temp_data)
+    # Попытаемся скачать и обработать фото
+    current_weight = None
+    photo_path = None
     
-    print(f"Фото успешно обработано и сохранено в состояние для {phone}")
-    
-    # Получаем данные для подтверждения
-    truck_number = temp_data.get('truck_number', '')
-    current_weight = temp_data.get('current_weight', 0)
-    previous_weight = temp_data.get('previous_weight', 0)
-    weight_difference = temp_data.get('weight_difference', 0)
-    
-    return f"""Подтверждение отчета
+    try:
+        # Получаем URL фотографии
+        if 'fileMessageData' in message_data:
+            photo_url = message_data.get('fileMessageData', {}).get('downloadUrl')
+        elif 'imageMessageData' in message_data:
+            photo_url = message_data.get('imageMessageData', {}).get('downloadUrl')
+        elif 'photoMessageData' in message_data:
+            photo_url = message_data.get('photoMessageData', {}).get('downloadUrl')
+        else:
+            photo_url = None
+        
+        if photo_url:
+            print(f"📥 Скачивание фото с URL: {photo_url}")
+            
+            # Скачиваем фото
+            import requests
+            response = requests.get(photo_url, timeout=30)
+            
+            if response.status_code == 200:
+                # Сохраняем фото локально
+                from datetime import datetime
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                photo_path = f'uploads/photos/{phone}_{timestamp}.jpg'
+                os.makedirs('uploads/photos', exist_ok=True)
+                
+                with open(photo_path, 'wb') as f:
+                    f.write(response.content)
+                
+                print(f"✅ Фото сохранено: {photo_path}")
+                
+                # Распознаем вес с помощью OCR
+                print(f"🔍 Распознавание веса с фотографии...")
+                weight, ocr_message, ocr_details = extract_weight_from_image(photo_path)
+                
+                if weight is not None:
+                    current_weight = weight
+                    print(f"✅ Вес распознан из фото: {weight} кг")
+                    temp_data['current_weight'] = current_weight
+                    temp_data['photo_received'] = True
+                    temp_data['ocr_details'] = ocr_details  # Сохраняем детали распознавания
+                    
+                    # Получаем предыдущий вес машины
+                    truck_number = temp_data.get('truck_number', '')
+                    previous_weight = db.get_last_weight(truck_number)
+                    temp_data['previous_weight'] = previous_weight
+                    
+                    # Вычисляем разницу
+                    weight_difference = current_weight - previous_weight
+                    temp_data['weight_difference'] = weight_difference
+                    temp_data['photo_path'] = photo_path
+                    
+                    print(f"   Текущий: {current_weight} кг")
+                    print(f"   Предыдущий: {previous_weight} кг")
+                    print(f"   Разница: {weight_difference:+.0f} кг")
+                    
+                    # Переходим к подтверждению
+                    db.set_user_state(phone, 'awaiting_confirmation', temp_data=temp_data)
+                    
+                    # Формируем сообщение подтверждения
+                    return f"""Подтверждение отчета
 
 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
 Телефон: {temp_data.get('driver_phone', '?')}
@@ -410,43 +542,37 @@ def handle_photo_received(phone: str, has_media: bool, message_data: dict = None
 Напишите "да" для сохранения
 Напишите "нет" для отмены
 """
+                else:
+                    # Вес не распознался - предлагаем несколько вариантов
+                    print(f"❌ Вес не распознан: {ocr_message}")
+                    
+                    # Переходим в режим ручного ввода веса с опцией повторной попытки
+                    db.set_user_state(phone, 'awaiting_manual_weight', temp_data=temp_data)
+                    
+                    return f"""{ocr_message}
 
+💡 *Варианты решения:*
 
-def handle_weight(phone: str, text: str) -> str:
-    """Обработка веса машины"""
-    try:
-        current_weight = float(text.strip())
-        
-        if current_weight <= 0:
-            return "Вес должен быть больше нуля"
-        
-        state = db.get_user_state(phone)
-        temp_data = state['temp_data'] if isinstance(state['temp_data'], dict) else {}
-        
-        temp_data['current_weight'] = current_weight
-        
-        # Получаем предыдущий вес машины
-        truck_number = temp_data.get('truck_number', '')
-        previous_weight = db.get_last_weight(truck_number)
-        
-        temp_data['previous_weight'] = previous_weight
-        
-        # Вычисляем разницу
-        weight_difference = current_weight - previous_weight
-        
-        print(f"Вес для машины {truck_number}:")
-        print(f"   Текущий: {current_weight} кг")
-        print(f"   Предыдущий: {previous_weight} кг")
-        print(f"   Разница: {weight_difference:+.0f} кг")
-        
-        temp_data['weight_difference'] = weight_difference
-        
-        db.set_user_state(phone, 'awaiting_photo', temp_data=temp_data)
-        
-        return "Отправьте фото показаний весов:"
+1️⃣ *Отправьте НОВОЕ фото* - лучше сфокусировано на табло весов
+2️⃣ *Введите вес вручную* - просто напишите число (например: 15000)
+
+⚠️ Важно: фото должно показывать четкие цифры на табло весов"""
+            else:
+                print(f"❌ Ошибка при скачивании фото: {response.status_code}")
+                return "❌ Ошибка при скачивании фото. Попробуйте еще раз."
+        else:
+            print(f"❌ URL фото не найден в сообщении")
+            return "❌ Не удалось получить фото. Попробуйте еще раз."
     
-    except ValueError:
-        return "Введите вес цифрами (например: 15500)"
+    except Exception as e:
+        print(f"❌ Ошибка обработки фото: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"""❌ Ошибка при обработке фото: {str(e)}
+
+Попробуйте отправить фото еще раз"""
+
+
 
 
 def handle_confirmation(phone: str, text: str) -> str:
