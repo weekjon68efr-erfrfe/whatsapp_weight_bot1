@@ -1,4 +1,4 @@
-"""
+""""""
 Модуль для распознавания веса с фотографий весов используя Tesseract OCR
 Более легкая альтернатива EasyOCR для работы на Railway
 """
@@ -39,22 +39,28 @@ def correct_image_orientation(image: np.ndarray) -> np.ndarray:
     
     # Пробуем разные углы поворота
     for angle in [0, 90, 180, 270]:
-        rotated = imutils_rotate_bound(image, angle)
-        rotated_gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-        
-        # Быстрое распознавание для проверки
         try:
-            text = pytesseract.image_to_string(rotated_gray, lang='rus+eng')
-            if text is None:
-                text = ""
-            # Считаем количество цифр
-            digit_count = sum(1 for c in text if c.isdigit())
+            rotated = imutils_rotate_bound(image, angle)
+            rotated_gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
             
-            if digit_count > best_count:
-                best_count = digit_count
-                best_image = rotated
-                best_angle = angle
-        except:
+            # Быстрое распознавание для проверки
+            try:
+                text = pytesseract.image_to_string(rotated_gray, lang='rus+eng')
+                if text is None or not isinstance(text, str):
+                    text = ""
+                
+                # Считаем количество цифр
+                digit_count = sum(1 for c in text if c.isdigit())
+                
+                if digit_count > best_count:
+                    best_count = digit_count
+                    best_image = rotated
+                    best_angle = angle
+            except Exception as e:
+                logger.debug(f"Ошибка распознавания при углу {angle}: {e}")
+                pass
+        except Exception as e:
+            logger.debug(f"Ошибка поворота {angle}: {e}")
             pass
     
     if best_angle != 0:
@@ -175,35 +181,47 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         
         # Пытаемся распознать с первым вариантом обработки
         logger.info(f"   Попытка 1: основной метод обработки")
-        text_primary = pytesseract.image_to_string(processed_primary, lang='rus+eng')
-        if text_primary is None:
+        try:
+            text_primary = pytesseract.image_to_string(processed_primary, lang='rus+eng')
+            if text_primary is None or not isinstance(text_primary, str):
+                text_primary = ""
+        except Exception as e:
+            logger.warning(f"   Ошибка при распознавании (попытка 1): {e}")
             text_primary = ""
-        weight, method, candidates = extract_weight_value_advanced(text_primary)
-        details['attempts'].append({'method': 'primary', 'weight': weight, 'text': text_primary})
         
-        if weight is not None:
-            details['method'] = method
-            details['candidates'] = candidates
-            details['confidence'] = 0.85
-            details['recognized_text'] = text_primary
-            logger.info(f"✅ Вес распознан (попытка 1): {weight} кг")
-            return weight, f"✅ Вес распознан: {weight:.0f} кг", details
+        if text_primary:
+            weight, method, candidates = extract_weight_value_advanced(text_primary)
+            details['attempts'].append({'method': 'primary', 'weight': weight, 'text': text_primary})
+            
+            if weight is not None:
+                details['method'] = method
+                details['candidates'] = candidates
+                details['confidence'] = 0.85
+                details['recognized_text'] = text_primary
+                logger.info(f"✅ Вес распознан (попытка 1): {weight} кг")
+                return weight, f"✅ Вес распознан: {weight:.0f} кг", details
         
         # Если не совпало - пробуем второй вариант обработки
         logger.info(f"   Попытка 2: альтернативный метод обработки")
-        text_secondary = pytesseract.image_to_string(processed_secondary, lang='rus+eng')
-        if text_secondary is None:
+        try:
+            text_secondary = pytesseract.image_to_string(processed_secondary, lang='rus+eng')
+            if text_secondary is None or not isinstance(text_secondary, str):
+                text_secondary = ""
+        except Exception as e:
+            logger.warning(f"   Ошибка при распознавании (попытка 2): {e}")
             text_secondary = ""
-        weight, method, candidates = extract_weight_value_advanced(text_secondary)
-        details['attempts'].append({'method': 'secondary', 'weight': weight, 'text': text_secondary})
         
-        if weight is not None:
-            details['method'] = method
-            details['candidates'] = candidates
-            details['confidence'] = 0.75
-            details['recognized_text'] = text_secondary
-            logger.info(f"✅ Вес распознан (попытка 2): {weight} кг")
-            return weight, f"✅ Вес распознан: {weight:.0f} кг", details
+        if text_secondary:
+            weight, method, candidates = extract_weight_value_advanced(text_secondary)
+            details['attempts'].append({'method': 'secondary', 'weight': weight, 'text': text_secondary})
+            
+            if weight is not None:
+                details['method'] = method
+                details['candidates'] = candidates
+                details['confidence'] = 0.75
+                details['recognized_text'] = text_secondary
+                logger.info(f"✅ Вес распознан (попытка 2): {weight} кг")
+                return weight, f"✅ Вес распознан: {weight:.0f} кг", details
         
         # Если оба варианта не сработали
         all_text = (text_primary + " " + text_secondary).strip()
@@ -237,65 +255,75 @@ def extract_weight_value_advanced(text: str) -> Tuple[Optional[float], str, List
     Returns:
         Кортеж (вес_в_кг, метод_распознавания, список_кандидатов)
     """
-    if not text or not text.strip():
-        return None, 'empty', []
-    
-    logger.info(f"   📝 Анализируем текст: {repr(text[:200])}")
-    
-    # Разбиваем текст на строки
-    lines = text.split('\n')
-    candidates = []
-    
-    for line_idx, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
+    try:
+        if not text or not isinstance(text, str) or not text.strip():
+            return None, 'empty', []
         
-        logger.info(f"   Строка {line_idx}: '{line}'")
+        logger.info(f"   📝 Анализируем текст: {repr(text[:200])}")
         
-        # Убираем пробелы внутри чисел
-        # "356 . 00" -> "356.00"
-        line_cleaned = re.sub(r'\s+([0-9])', r'\1', line)
-        line_cleaned = re.sub(r'([0-9])\s+', r'\1', line_cleaned)
+        # Разбиваем текст на строки
+        lines = text.split('\n')
+        candidates = []
         
-        # Ищем все последовательности цифр и точек/запятых
-        # например: 356.00, 356,00, 35600
-        number_matches = re.findall(r'([0-9][0-9.,]*[0-9]|[0-9]+)', line_cleaned)
-        
-        for match in number_matches:
-            # Убираем точки и запятые из числа
-            clean_num = match.replace('.', '').replace(',', '')
-            
-            # Пропускаем если начинается с 0
-            if clean_num[0] == '0':
-                logger.info(f"      ⏭️ Пропускаем (начинается с 0): {match}")
-                continue
-            
-            # Пропускаем если только нули (0, 00, 000, т.д.)
-            if all(c == '0' for c in clean_num):
-                logger.info(f"      ⏭️ Пропускаем (только нули): {match}")
-                continue
-            
+        for line_idx, line in enumerate(lines):
             try:
-                # Конвертируем в число
-                value = float(clean_num)
-                logger.info(f"      ✓ Найдено число: {match} → {value}")
-                candidates.append(value)
-            except ValueError:
-                pass
+                line = str(line).strip() if line else ""
+                if not line:
+                    continue
+                
+                logger.info(f"   Строка {line_idx}: '{line}'")
+                
+                # Убираем пробелы внутри чисел
+                line_cleaned = re.sub(r'\s+([0-9])', r'\1', line)
+                line_cleaned = re.sub(r'([0-9])\s+', r'\1', line_cleaned)
+                
+                # Ищем все последовательности цифр и точек/запятых
+                number_matches = re.findall(r'([0-9][0-9.,]*[0-9]|[0-9]+)', line_cleaned)
+                
+                for match in number_matches:
+                    try:
+                        # Убираем точки и запятые из числа
+                        clean_num = str(match).replace('.', '').replace(',', '')
+                        
+                        if not clean_num or not clean_num[0].isdigit():
+                            continue
+                        
+                        # Пропускаем если начинается с 0
+                        if clean_num[0] == '0':
+                            logger.info(f"      ⏭️ Пропускаем (начинается с 0): {match}")
+                            continue
+                        
+                        # Пропускаем если только нули
+                        if all(c == '0' for c in clean_num):
+                            logger.info(f"      ⏭️ Пропускаем (только нули): {match}")
+                            continue
+                        
+                        # Конвертируем в число
+                        value = float(clean_num)
+                        logger.info(f"      ✓ Найдено число: {match} → {value}")
+                        candidates.append(value)
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logger.debug(f"      Ошибка обработки {match}: {e}")
+                        continue
+            except Exception as e:
+                logger.warning(f"   Ошибка обработки строки {line_idx}: {e}")
+                continue
+        
+        # Фильтруем кандидатов
+        valid_candidates = [c for c in candidates if isinstance(c, (int, float)) and 100 <= c <= 100000]
+        
+        if valid_candidates:
+            logger.info(f"   ✅ Валидные кандидаты: {valid_candidates}")
+            final_weight = valid_candidates[0]
+            logger.info(f"   ✅ Выбран: {final_weight}")
+            return final_weight, 'direct_match', valid_candidates
+        
+        logger.warning(f"❌ Вес не найден в тексте")
+        return None, 'not_found', candidates
     
-    # Фильтруем кандидатов по разумному диапазону для грузовика
-    valid_candidates = [c for c in candidates if 100 <= c <= 100000]
-    
-    if valid_candidates:
-        logger.info(f"   ✅ Валидные кандидаты: {valid_candidates}")
-        # Возвращаем первый найденный (обычно он в первой строке - это основной вес)
-        final_weight = valid_candidates[0]
-        logger.info(f"   ✅ Выбран: {final_weight}")
-        return final_weight, 'direct_match', valid_candidates
-    
-    logger.warning(f"❌ Вес не найден в тексте")
-    return None, 'not_found', candidates
+    except Exception as e:
+        logger.error(f"❌ Ошибка в extract_weight_value_advanced: {e}")
+        return None, 'error', []
 
 
 def extract_weight_value(text: str) -> Optional[float]:
@@ -323,3 +351,4 @@ def validate_weight(weight: float) -> bool:
         True если вес в допустимом диапазоне
     """
     return 5000 <= weight <= 60000
+
