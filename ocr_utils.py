@@ -1,8 +1,8 @@
 """
-Модуль для распознавания веса с фотографий весов используя OCR
-Включает автоматическую ориентацию, детектирование цифр и валидацию
+Модуль для распознавания веса с фотографий весов используя Tesseract OCR
+Более легкая альтернатива EasyOCR для работы на Railway
 """
-import easyocr
+import pytesseract
 import cv2
 import numpy as np
 import re
@@ -12,17 +12,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Инициализируем OCR reader один раз (для экономии памяти и скорости)
-_reader = None
-
-
-def get_ocr_reader():
-    """Получить или создать OCR reader"""
-    global _reader
-    if _reader is None:
-        logger.info("🔧 Инициализация EasyOCR reader для русского и английского...")
-        _reader = easyocr.Reader(['ru', 'en'], gpu=False)
-    return _reader
+# Путь к tesseract (для Railway и локальной установки)
+try:
+    # Для Linux на Railway
+    pytesseract.pytesseract.pytesseract_cmd = '/usr/bin/tesseract'
+except:
+    pass
 
 
 def correct_image_orientation(image: np.ndarray) -> np.ndarray:
@@ -37,7 +32,6 @@ def correct_image_orientation(image: np.ndarray) -> np.ndarray:
         Оптимально ориентированное изображение
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    reader = get_ocr_reader()
     
     best_image = image.copy()
     best_count = 0
@@ -50,9 +44,9 @@ def correct_image_orientation(image: np.ndarray) -> np.ndarray:
         
         # Быстрое распознавание для проверки
         try:
-            results = reader.readtext(rotated_gray, detail=0)
+            text = pytesseract.image_to_string(rotated_gray, lang='rus+eng')
             # Считаем количество цифр
-            digit_count = sum(1 for text in results if any(c.isdigit() for c in text))
+            digit_count = sum(1 for c in text if c.isdigit())
             
             if digit_count > best_count:
                 best_count = digit_count
@@ -137,8 +131,7 @@ def preprocess_image(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Dict]:
     """
-    Распознать вес с фотографии весов с детальной информацией о результате
-    Использует два варианта предварительной обработки для лучшей надежности
+    Распознать вес с фотографии весов используя Tesseract OCR
     
     Args:
         image_path: путь к файлу с изображением весов
@@ -152,7 +145,7 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         'method': '',
         'candidates': [],
         'error': None,
-        'attempts': []  # История попыток разных методов
+        'attempts': []
     }
     
     try:
@@ -174,44 +167,40 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         image = correct_image_orientation(image)
         logger.info(f"   ✓ Ориентация исправлена")
         
-        # Предварительная обработка - получаем два варианта
+        # Предварительная обработка - получаем двавариант
         processed_primary, processed_secondary = preprocess_image(image)
         logger.info(f"   ✓ Изображение обработано (2 варианта)")
         
-        reader = get_ocr_reader()
-        
         # Пытаемся распознать с первым вариантом обработки
         logger.info(f"   Попытка 1: основной метод обработки")
-        results_primary = reader.readtext(processed_primary, detail=1)
-        weight, method, candidates = _extract_weight_from_results(results_primary, "primary")
-        details['attempts'].append({'method': 'primary', 'weight': weight, 'candidates': candidates})
+        text_primary = pytesseract.image_to_string(processed_primary, lang='rus+eng')
+        weight, method, candidates = extract_weight_value_advanced(text_primary)
+        details['attempts'].append({'method': 'primary', 'weight': weight, 'text': text_primary})
         
         if weight is not None:
             details['method'] = method
             details['candidates'] = candidates
             details['confidence'] = 0.85
-            details['recognized_text'] = ' '.join([text for _, text, _ in results_primary])
+            details['recognized_text'] = text_primary
             logger.info(f"✅ Вес распознан (попытка 1): {weight} кг")
             return weight, f"✅ Вес распознан: {weight:.0f} кг", details
         
         # Если не совпало - пробуем второй вариант обработки
         logger.info(f"   Попытка 2: альтернативный метод обработки")
-        results_secondary = reader.readtext(processed_secondary, detail=1)
-        weight, method, candidates = _extract_weight_from_results(results_secondary, "secondary")
-        details['attempts'].append({'method': 'secondary', 'weight': weight, 'candidates': candidates})
+        text_secondary = pytesseract.image_to_string(processed_secondary, lang='rus+eng')
+        weight, method, candidates = extract_weight_value_advanced(text_secondary)
+        details['attempts'].append({'method': 'secondary', 'weight': weight, 'text': text_secondary})
         
         if weight is not None:
             details['method'] = method
             details['candidates'] = candidates
-            details['confidence'] = 0.75  # Слегка ниже, так как это альтернативный метод
-            details['recognized_text'] = ' '.join([text for _, text, _ in results_secondary])
+            details['confidence'] = 0.75
+            details['recognized_text'] = text_secondary
             logger.info(f"✅ Вес распознан (попытка 2): {weight} кг")
             return weight, f"✅ Вес распознан: {weight:.0f} кг", details
         
         # Если оба варианта не сработали
-        all_text_primary = ' '.join([text for _, text, _ in results_primary]) if results_primary else ""
-        all_text_secondary = ' '.join([text for _, text, _ in results_secondary]) if results_secondary else ""
-        all_text = (all_text_primary + " " + all_text_secondary).strip()
+        all_text = (text_primary + " " + text_secondary).strip()
         
         if all_text:
             details['recognized_text'] = all_text
@@ -227,27 +216,6 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         logger.error(f"❌ Ошибка обработки изображения: {e}")
         details['error'] = str(e)
         return None, f"❌ Ошибка обработки изображения: {str(e)}", details
-
-
-def _extract_weight_from_results(results: list, method_name: str) -> Tuple[Optional[float], str, List[float]]:
-    """
-    Вспомогательная функция для извлечения веса из результатов OCR
-    
-    Args:
-        results: результаты от reader.readtext()
-        method_name: название метода обработки (для логирования)
-        
-    Returns:
-        Кортеж (вес, метод_распознавания, кандидаты)
-    """
-    if not results:
-        logger.info(f"   📭 Нет результатов OCR ({method_name})")
-        return None, 'empty', []
-    
-    all_text = " ".join([text for _, text, _ in results])
-    logger.info(f"   📝 Распознанный текст ({method_name}): {all_text[:100]}...")
-    
-    return extract_weight_value_advanced(all_text)
 
 
 def extract_weight_value_advanced(text: str) -> Tuple[Optional[float], str, List[float]]:
