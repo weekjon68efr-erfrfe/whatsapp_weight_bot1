@@ -419,12 +419,13 @@ def _gpt_assist_from_text(text: str) -> Tuple[Optional[float], List]:
         if not OPENAI_AVAILABLE:
             return None, []
 
+        # Формируем подсказку для GPT из текста OCR
         prompt = (
             "Вам дан неструктурированный текст, полученный из OCR с табло весов. "
             "Найдите одно целое число (в килограммах) в диапазоне 100-150000, которое наиболее вероятно соответствует весу на табло. "
             "Если такого числа нет, ответьте SINGLE WORD: NONE. "
-            "Вход (OCR):\n```
-" + text + "\n```")
+            "Вход (OCR):\n```"
+        ) + text + "\n```"
 
         try:
             resp = openai.ChatCompletion.create(
