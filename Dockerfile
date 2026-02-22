@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 # Обновим pip/setuptools/wheel, чтобы pip мог загрузить prebuilt wheels (решает ошибки сборки типа PyMuPDF)
 RUN pip install --upgrade pip setuptools wheel
+RUN pip install --prefer-binary --no-cache-dir PyMuPDF==1.20.1 || true
 RUN pip install --prefer-binary --no-cache-dir -r requirements.txt
 
 # Копируем код приложения
