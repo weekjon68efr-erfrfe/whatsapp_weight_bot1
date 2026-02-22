@@ -21,6 +21,29 @@ except ImportError:
     PADDLE_AVAILABLE = False
     logger.warning("⚠️ PaddleOCR не установлена")
 
+# Попытка инициализировать OpenAI (опционально)
+try:
+    import openai
+    OPENAI_AVAILABLE = bool(os.getenv('OPENAI_API_KEY'))
+    if OPENAI_AVAILABLE:
+        openai.api_key = os.getenv('OPENAI_API_KEY')
+        logger.info("✅ OpenAI client initialized (OPENAI_API_KEY detected)")
+    else:
+        logger.info("🔎 OpenAI API key not set; GPT assist disabled")
+except Exception:
+    OPENAI_AVAILABLE = False
+    logger.info("🔎 OpenAI package not installed; GPT assist disabled")
+
+# Попытка инициализировать pytesseract (опционально)
+try:
+    import pytesseract
+    from PIL import Image
+    TESSERACT_AVAILABLE = True
+    logger.info("🔎 pytesseract available")
+except Exception:
+    TESSERACT_AVAILABLE = False
+    logger.info("🔎 pytesseract not available")
+
 
 def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Dict]:
     """
@@ -69,7 +92,33 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
             details['candidates'] = candidates
             logger.info(f"✅ Вес распознан (CV2): {weight} кг")
             return weight, "", details
-        
+
+        # Tesseract fallback (опционально)
+        if TESSERACT_AVAILABLE:
+            try:
+                t_weight, t_candidates, t_text = _extract_with_tesseract(image)
+                # Добавим текст tesseract в детали для диагностики
+                details['text'] = (details.get('text', '') + ' ' + (t_text or '')).strip()
+                if t_weight is not None:
+                    details['method'] = 'tesseract'
+                    details['candidates'] = t_candidates
+                    logger.info(f"✅ Вес распознан (Tesseract): {t_weight} кг")
+                    return t_weight, "", details
+            except Exception as e:
+                logger.debug(f"Tesseract fallback failed: {e}")
+
+        # Попробуем GPT-помощника по распознанному тексту (опционально)
+        if OPENAI_AVAILABLE:
+            try:
+                gpt_weight, gpt_candidates = _gpt_assist_from_text(details.get('text', ''))
+                if gpt_weight is not None:
+                    details['method'] = 'gpt'
+                    details['candidates'] = gpt_candidates
+                    logger.info(f"✅ Вес распознан (GPT): {gpt_weight} кг")
+                    return gpt_weight, "", details
+            except Exception as e:
+                logger.debug(f"GPT assist failed: {e}")
+
         # Ничего не сработало
         return None, """❌ Не удалось автоматически определить вес
 
@@ -241,6 +290,71 @@ def _extract_with_cv2(image: np.ndarray) -> Tuple[Optional[float], List]:
         return None, []
 
 
+def _extract_with_tesseract(image: np.ndarray) -> Tuple[Optional[float], List, str]:
+    """Попытка распознать цифры с помощью pytesseract. Возвращает (weight, candidates, raw_text)."""
+    try:
+        attempts_text = ""
+        # Предобработка общего изображения
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        proc = clahe.apply(gray)
+
+        # Попробуем несколько конфигураций: full image и ROI по контурам
+        pil = None
+        try:
+            pil = Image.fromarray(proc)
+        except Exception:
+            pil = None
+
+        # Попытка 1: вся картинка, PSM 7 (single text line), цифры только
+        try:
+            if pil is not None:
+                cfg = '--psm 7 -c tessedit_char_whitelist=0123456789'
+                txt = pytesseract.image_to_string(pil, config=cfg)
+                if txt:
+                    attempts_text += txt + ' '
+        except Exception:
+            pass
+
+        # Попытка 2: найти яркие/тёмные контуры и распознать каждый ROI
+        try:
+            _, thr = cv2.threshold(proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thr = cv2.bitwise_not(thr)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=2)
+            contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 30 or area > 20000:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w < 6 or h < 6:
+                    continue
+                roi = proc[y:y+h, x:x+w]
+                try:
+                    roi = cv2.resize(roi, (max(32, w*3), max(32, h*3)), interpolation=cv2.INTER_LINEAR)
+                except Exception:
+                    pass
+                try:
+                    pil_roi = Image.fromarray(roi)
+                    cfg = '--psm 7 -c tessedit_char_whitelist=0123456789'
+                    txt = pytesseract.image_to_string(pil_roi, config=cfg)
+                    if txt:
+                        attempts_text += txt + ' '
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Финальный парсинг собранного текста
+        weight, candidates = _parse_weight(attempts_text)
+        return weight, candidates, attempts_text
+
+    except Exception as e:
+        logger.debug(f"Tesseract error: {e}")
+        return None, [], ""
+
+
 def _parse_weight(text: str) -> Tuple[Optional[float], List]:
     """
     Парсим вес из распознанного текста
@@ -293,6 +407,61 @@ def _parse_weight(text: str) -> Tuple[Optional[float], List]:
     
     except Exception as e:
         logger.error(f"Ошибка парсинга: {e}")
+        return None, []
+
+
+def _gpt_assist_from_text(text: str) -> Tuple[Optional[float], List]:
+    """Использовать GPT (через OpenAI) для выбора наиболее вероятного веса из предоставленного текста.
+
+    Возвращает (weight, candidates)
+    """
+    try:
+        if not OPENAI_AVAILABLE:
+            return None, []
+
+        prompt = (
+            "Вам дан неструктурированный текст, полученный из OCR с табло весов. "
+            "Найдите одно целое число (в килограммах) в диапазоне 100-150000, которое наиболее вероятно соответствует весу на табло. "
+            "Если такого числа нет, ответьте SINGLE WORD: NONE. "
+            "Вход (OCR):\n```
+" + text + "\n```")
+
+        try:
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You extract a single integer weight in kg from noisy OCR text. Reply with the integer only or NONE."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=30,
+                temperature=0.0,
+            )
+            gpt_text = resp['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            logger.debug(f"OpenAI request failed: {e}")
+            return None, []
+
+        # Парсим ответ GPT на предмет числа
+        if not gpt_text or gpt_text.upper().strip() == 'NONE':
+            return None, []
+
+        # Ищем числа в ответе
+        nums = re.findall(r"\d+", gpt_text)
+        candidates = []
+        for n in nums:
+            try:
+                v = float(n)
+                if 100 <= v <= 150000:
+                    candidates.append(v)
+            except Exception:
+                continue
+
+        if candidates:
+            return max(candidates), candidates
+
+        return None, []
+    except Exception as e:
+        logger.debug(f"GPT assist internal error: {e}")
         return None, []
 
 
