@@ -1,6 +1,6 @@
 """
 Модуль для распознавания веса с фотографий весов
-Использует Tesseract OCR с fallback на ручной ввод
+Использует PaddleOCR для распознавания цифр на LED табло
 """
 import cv2
 import numpy as np
@@ -11,22 +11,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Пытаемся использовать pytesseract если он доступен
+# Инициализируем PaddleOCR
 try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-    try:
-        pytesseract.pytesseract.pytesseract_cmd = '/usr/bin/tesseract'
-    except:
-        pass
+    from paddleocr import PaddleOCR
+    PADDLE_AVAILABLE = True
+    ocr = PaddleOCR(use_angle_cls=True, lang='en')
+    logger.info("✅ PaddleOCR инициализирована")
 except ImportError:
-    TESSERACT_AVAILABLE = False
-    logger.warning("pytesseract не установлен, используется fallback режим")
+    PADDLE_AVAILABLE = False
+    logger.warning("⚠️ PaddleOCR не установлена")
 
 
 def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Dict]:
     """
-    Распознать вес с фотографии весов
+    Распознать вес с фотографии весов используя PaddleOCR
     
     Args:
         image_path: путь к файлу с изображением
@@ -37,6 +35,7 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
     details = {
         'method': 'none',
         'error': None,
+        'text': '',
         'candidates': []
     }
     
@@ -50,60 +49,123 @@ def extract_weight_from_image(image_path: str) -> Tuple[Optional[float], str, Di
         
         logger.info(f"🔍 Распознавание из {image_path}")
         
-        # Попытка 1: Tesseract
-        if TESSERACT_AVAILABLE:
-            weight, candidates = _extract_with_tesseract(image)
+        # Если PaddleOCR доступна
+        if PADDLE_AVAILABLE:
+            weight, candidates, text = _extract_with_paddle(image)
+            details['text'] = text
+            details['candidates'] = candidates
+            
             if weight is not None:
-                details['method'] = 'tesseract'
-                details['candidates'] = candidates
+                details['method'] = 'paddle'
+                logger.info(f"✅ Вес распознан: {weight} кг")
                 return weight, "", details
+            
+            logger.debug(f"PaddleOCR: вес не найден в тексте: {text}")
         
-        # Попытка 2: Простой CV2 метод
+        # Fallback: попытка распознать с CV2 + простой парсинг
         weight, candidates = _extract_with_cv2(image)
         if weight is not None:
             details['method'] = 'cv2'
             details['candidates'] = candidates
+            logger.info(f"✅ Вес распознан (CV2): {weight} кг")
             return weight, "", details
         
         # Ничего не сработало
         return None, """❌ Не удалось автоматически определить вес
 
 💡 Пожалуйста:
-1. Отправьте *новое фото* (более четкое табло)
-2. ИЛИ введите вес *вручную* (например: 15000)""", details
+1. Отправьте *новое фото* - более четкое табло весов
+2. ИЛИ введите вес *вручную* (например: 22380)
+
+⚠️ Совет: фото должно быть четким и ярким, табло видно полностью""", details
     
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         details['error'] = str(e)
-        return None, f"❌ Ошибка обработки: {str(e)}", details
+        return None, f"❌ Ошибка обработки фото: {str(e)}", details
 
 
-def _extract_with_tesseract(image: np.ndarray) -> Tuple[Optional[float], List]:
-    """Распознавание с помощью Tesseract"""
+def _extract_with_paddle(image: np.ndarray) -> Tuple[Optional[float], List, str]:
+    """Распознавание с помощью PaddleOCR"""
     try:
+        # Улучшаем контраст для лучшего распознавания
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Улучшение контраста
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # CLAHE для улучшения контраста
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         
-        # Бинаризация
-        _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Конвертируем обратно в BGR для PaddleOCR
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         
-        # OCR
-        text = pytesseract.image_to_string(binary, lang='rus+eng')
-        if not text or not isinstance(text, str):
-            return None, []
-        
-        weight, candidates = _parse_weight(text)
-        return weight, candidates
+        # Запускаем OCR
+        logger.info("   Запуск PaddleOCR...")
+        results = ocr.ocr(enhanced_bgr, cls=True)
+
+        if not results or not results[0]:
+            logger.debug("   PaddleOCR вернула пусто")
+            return None, [], ""
+
+        # Собираем распознанные сегменты с confidence
+        all_text = ""
+        detected_segments: List[Tuple[str, float]] = []
+        for item in results[0]:
+            # Попытка получить текст и confidence в различных возможных форматах
+            text = None
+            conf = None
+            try:
+                # Формат: [box, (text, confidence)]
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (list, tuple)):
+                    candidate = item[1]
+                    if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+                        text = candidate[0]
+                        conf = float(candidate[1])
+                # Ранее код использовал item[0] как текст — на случай старых версий
+                if text is None:
+                    if isinstance(item, (list, tuple)) and len(item) > 0:
+                        maybe = item[0]
+                        if isinstance(maybe, str):
+                            text = maybe
+            except Exception:
+                pass
+
+            if text:
+                text = str(text).strip()
+                if conf is None:
+                    # Если confidence не извлечён — назначаем низкое по умолчанию
+                    conf = 0.0
+                detected_segments.append((text, conf))
+                all_text += text + " "
+                logger.debug(f"   Распознано: {text} (conf={conf})")
+
+        logger.info(f"   Полный текст: {all_text}")
+
+        # Попробуем сначала собрать все числовые сегменты с приемлемым confidence
+        numeric_concat = ""
+        for seg, conf in detected_segments:
+            if re.search(r"\d", seg) and conf >= 0.35:
+                numeric_concat += seg + " "
+
+        # Если собрали числовые сегменты — парсим их в приоритетном порядке
+        if numeric_concat:
+            weight, candidates = _parse_weight(numeric_concat)
+            if weight is not None:
+                return weight, candidates, all_text
+
+        # Иначе парсим весь распознанный текст
+        weight, candidates = _parse_weight(all_text)
+
+        return weight, candidates, all_text
+    
     except Exception as e:
-        logger.debug(f"Tesseract ошибка: {e}")
-        return None, []
+        logger.debug(f"PaddleOCR ошибка: {e}")
+        return None, [], ""
 
 
 def _extract_with_cv2(image: np.ndarray) -> Tuple[Optional[float], List]:
-    """Попытка распознать вес с помощью CV2"""
+    """Fallback метод с CV2"""
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
@@ -111,73 +173,140 @@ def _extract_with_cv2(image: np.ndarray) -> Tuple[Optional[float], List]:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         contrast = clahe.apply(gray)
         
-        # Ищем светлые области (цифры)
-        _, white_mask = cv2.threshold(contrast, 150, 255, cv2.THRESH_BINARY)
-        
-        # Морфология
+        # Условная бинаризация и адаптивная обработка для извлечения цифр
+        # Попробуем adaptiveThreshold для неравномерного освещения
+        try:
+            adaptive = cv2.adaptiveThreshold(contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                             cv2.THRESH_BINARY_INV, 31, 9)
+        except Exception:
+            _, adaptive = cv2.threshold(contrast, 150, 255, cv2.THRESH_BINARY_INV)
+
+        # Морфология для слияния компонент
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # Находим контуры
-        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Ищем цифры
-        all_text = ""
+        adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=2)
+        adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        all_numbers = ""
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if 50 < area < 10000:
+            if 50 < area < 20000:
                 x, y, w, h = cv2.boundingRect(cnt)
-                if 8 < w < 100 and 10 < h < 100:
+                if 6 < w < 400 and 8 < h < 200:
                     roi = contrast[y:y+h, x:x+w]
-                    if TESSERACT_AVAILABLE:
+
+                    # Увеличим ROI для улучшения OCR
+                    scale = 2
+                    try:
+                        roi = cv2.resize(roi, (w*scale, h*scale), interpolation=cv2.INTER_LINEAR)
+                    except Exception:
+                        pass
+
+                    # Порог и очистка шума внутри ROI
+                    try:
+                        roi = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                     cv2.THRESH_BINARY, 15, 6)
+                    except Exception:
+                        _, roi = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                    if PADDLE_AVAILABLE:
                         try:
-                            text = pytesseract.image_to_string(roi, lang='rus+eng', config='--psm 6')
-                            if text:
-                                all_text += text
-                        except:
+                            roi_bgr = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+                            results = ocr.ocr(roi_bgr, cls=False)
+                            if results and results[0]:
+                                for det in results[0]:
+                                    # попытаемся получить текст/конф
+                                    txt = None
+                                    try:
+                                        if isinstance(det, (list, tuple)) and len(det) >= 2 and isinstance(det[1], (list, tuple)):
+                                            txt = det[1][0]
+                                        elif isinstance(det[0], str):
+                                            txt = det[0]
+                                    except Exception:
+                                        txt = None
+                                    if txt:
+                                        all_numbers += str(txt) + " "
+                        except Exception:
                             pass
-        
-        if all_text:
-            weight, candidates = _parse_weight(all_text)
+
+        if all_numbers:
+            weight, candidates = _parse_weight(all_numbers)
             return weight, candidates
-        
+
         return None, []
+    
     except Exception as e:
         logger.debug(f"CV2 ошибка: {e}")
         return None, []
 
 
 def _parse_weight(text: str) -> Tuple[Optional[float], List]:
-    """Парсим вес из текста"""
+    """
+    Парсим вес из распознанного текста
+    Ищет любое число в диапазоне 100-150000
+    """
     try:
         if not text or not isinstance(text, str):
             return None, []
         
-        # Ищем все числа
-        numbers = re.findall(r'\d+', text)
-        candidates = []
+        logger.debug(f"   Парсим текст: {text}")
         
-        for num_str in numbers:
+        # На входе: текст с потенциальными цифрами, возможно разделёнными пробелами/запятыми/точками
+        # Ищем все фрагменты, содержащие цифры и знаки разделителей
+        raw_numbers = re.findall(r'[\d\.,\s]+', text)
+        candidates: List[float] = []
+
+        def _clean_number_string(s: str) -> Optional[float]:
+            s = s.strip()
+            if not s or not re.search(r'\d', s):
+                return None
+            # Убираем точки и запятые — десятичных дробей нет, считаем только целые цифры
+            s = s.replace('.', '')
+            s = s.replace(',', '')
+            # Удаляем все не-цифры (включая пробелы)
+            s = re.sub(r'[^0-9]', '', s)
+            if not s:
+                return None
             try:
-                num = float(num_str)
-                if 100 <= num <= 100000:
-                    candidates.append(num)
-            except:
-                pass
-        
+                return float(s)
+            except Exception:
+                return None
+
+        for raw in raw_numbers:
+            val = _clean_number_string(raw)
+            if val is None:
+                continue
+            if 100 <= val <= 150000:
+                candidates.append(val)
+                logger.debug(f"      ✓ Добавлен кандидат: {val}")
+            else:
+                logger.debug(f"      ✗ Число {val} вне диапазона")
+
         if candidates:
-            return candidates[0], candidates
-        
+            # Возвращаем наиболее правдоподобный кандидат — максимально крупный (табло обычно показывает полный вес)
+            best = max(candidates)
+            return best, candidates
+
+        logger.debug(f"   ❌ Никаких валидных чисел не найдено")
         return None, candidates
+    
     except Exception as e:
         logger.error(f"Ошибка парсинга: {e}")
         return None, []
 
 
 def validate_weight(weight: float) -> bool:
-    """Проверить вес"""
+    """
+    Проверить разумность значения веса
+    
+    Args:
+        weight: Вес в кг
+        
+    Returns:
+        True если вес в допустимом диапазоне
+    """
     try:
-        return 100 <= weight <= 100000
+        return 100 <= weight <= 150000
     except:
         return False

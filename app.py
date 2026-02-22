@@ -496,7 +496,8 @@ def handle_confirmation(phone: str, text: str) -> str:
         'client_name': temp_data.get('client_name', ''),
         'current_weight': temp_data.get('current_weight', 0),
         'station_name': '',
-        'photo_received': temp_data.get('photo_received', False)
+        'photo_received': temp_data.get('photo_received', False),
+        'photo_path': temp_data.get('photo_path', '')
     }
     
     result = db.save_weighing(weighing_data)
