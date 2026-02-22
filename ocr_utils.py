@@ -11,6 +11,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Допустимый диапазон веса — можно переопределить через окружение
+try:
+    MIN_WEIGHT = int(os.getenv('MIN_WEIGHT', '1'))
+except Exception:
+    MIN_WEIGHT = 1
+try:
+    MAX_WEIGHT = int(os.getenv('MAX_WEIGHT', '150000'))
+except Exception:
+    MAX_WEIGHT = 150000
+
 # Инициализируем PaddleOCR
 try:
     from paddleocr import PaddleOCR
@@ -213,6 +223,67 @@ def _extract_with_paddle(image: np.ndarray) -> Tuple[Optional[float], List, str]
         return None, [], ""
 
 
+def _extract_led_by_color(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Попытаться выделить область семисегментного табло по цвету (красный/оранжевый)
+    Возвращает ROI (BGR) или None
+    """
+    try:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        blur = cv2.GaussianBlur(hsv, (5, 5), 0)
+
+        # Диапазоны для красного (две области в HSV) и оранжевого/жёлтого
+        lower_red1 = np.array([0, 80, 50])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 80, 50])
+        upper_red2 = np.array([180, 255, 255])
+        lower_orange = np.array([8, 70, 40])
+        upper_orange = np.array([25, 255, 255])
+
+        mask1 = cv2.inRange(blur, lower_red1, upper_red1)
+        mask2 = cv2.inRange(blur, lower_red2, upper_red2)
+        mask3 = cv2.inRange(blur, lower_orange, upper_orange)
+        mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.bitwise_or(mask, mask3)
+
+        # Очистка шума
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        # Ищем самый крупный контур — предполагаем табло
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        h_img, w_img = image.shape[:2]
+        for cnt in contours[:5]:
+            area = cv2.contourArea(cnt)
+            if area < 200:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            # пропускаем очень узкие/высокие регионы
+            if w < 30 or h < 10:
+                continue
+            # расширим bbox немного
+            pad_x = int(w * 0.08) + 2
+            pad_y = int(h * 0.12) + 2
+            x0 = max(0, x - pad_x)
+            y0 = max(0, y - pad_y)
+            x1 = min(w_img, x + w + pad_x)
+            y1 = min(h_img, y + h + pad_y)
+            roi = image[y0:y1, x0:x1]
+            if roi.size == 0:
+                continue
+            return roi
+
+        return None
+    except Exception as e:
+        logger.debug(f"LED color extract error: {e}")
+        return None
+
+
 def _extract_with_cv2(image: np.ndarray) -> Tuple[Optional[float], List]:
     """Fallback метод с CV2"""
     try:
@@ -221,6 +292,57 @@ def _extract_with_cv2(image: np.ndarray) -> Tuple[Optional[float], List]:
         # Контраст
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         contrast = clahe.apply(gray)
+
+        # Попробуем сначала выделить табло по цвету (красные/оранжевые светодиоды)
+        led_roi = _extract_led_by_color(image)
+        if led_roi is not None:
+            try:
+                # Подготовим ROI для OCR: увеличение и контраст
+                roi_gray = cv2.cvtColor(led_roi, cv2.COLOR_BGR2GRAY)
+                try:
+                    roi_gray = cv2.resize(roi_gray, (roi_gray.shape[1]*2, roi_gray.shape[0]*2), interpolation=cv2.INTER_LINEAR)
+                except Exception:
+                    pass
+                clahe_r = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                roi_proc = clahe_r.apply(roi_gray)
+
+                # Сначала попробуем Paddle на ROI
+                if PADDLE_AVAILABLE:
+                    try:
+                        roi_bgr = cv2.cvtColor(roi_proc, cv2.COLOR_GRAY2BGR)
+                        res = ocr.ocr(roi_bgr, cls=False)
+                        collected = ""
+                        if res and res[0]:
+                            for det in res[0]:
+                                try:
+                                    if isinstance(det, (list, tuple)) and len(det) >= 2 and isinstance(det[1], (list, tuple)):
+                                        collected += str(det[1][0]) + " "
+                                    elif isinstance(det[0], str):
+                                        collected += str(det[0]) + " "
+                                except Exception:
+                                    continue
+                        if collected:
+                            weight, candidates = _parse_weight(collected)
+                            if weight is not None:
+                                return weight, candidates
+                    except Exception:
+                        pass
+
+                # Потом Tesseract
+                if TESSERACT_AVAILABLE:
+                    try:
+                        from PIL import Image
+                        pil = Image.fromarray(roi_proc)
+                        cfg = '--psm 7 -c tessedit_char_whitelist=0123456789'
+                        txt = pytesseract.image_to_string(pil, config=cfg)
+                        if txt:
+                            weight, candidates = _parse_weight(txt)
+                            if weight is not None:
+                                return weight, candidates
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         
         # Условная бинаризация и адаптивная обработка для извлечения цифр
         # Попробуем adaptiveThreshold для неравномерного освещения
@@ -358,7 +480,7 @@ def _extract_with_tesseract(image: np.ndarray) -> Tuple[Optional[float], List, s
 def _parse_weight(text: str) -> Tuple[Optional[float], List]:
     """
     Парсим вес из распознанного текста
-    Ищет любое число в диапазоне 100-150000
+    Ищет любое число в диапазоне MIN_WEIGHT-MAX_WEIGHT
     """
     try:
         if not text or not isinstance(text, str):
@@ -391,11 +513,11 @@ def _parse_weight(text: str) -> Tuple[Optional[float], List]:
             val = _clean_number_string(raw)
             if val is None:
                 continue
-            if 100 <= val <= 150000:
+            if MIN_WEIGHT <= val <= MAX_WEIGHT:
                 candidates.append(val)
                 logger.debug(f"      ✓ Добавлен кандидат: {val}")
             else:
-                logger.debug(f"      ✗ Число {val} вне диапазона")
+                logger.debug(f"      ✗ Число {val} вне диапазона {MIN_WEIGHT}-{MAX_WEIGHT}")
 
         if candidates:
             # Возвращаем наиболее правдоподобный кандидат — максимально крупный (табло обычно показывает полный вес)
@@ -477,6 +599,6 @@ def validate_weight(weight: float) -> bool:
         True если вес в допустимом диапазоне
     """
     try:
-        return 100 <= weight <= 150000
+        return MIN_WEIGHT <= weight <= MAX_WEIGHT
     except:
         return False
